@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Text menu for the digital preservation workstation.
+
+CASES="$HOME/cases"
+PATH="$PATH:/usr/games"
+have()  { command -v "$1" >/dev/null 2>&1; }
+pause() { echo; read -r -p "Press Enter to return to the menu... " _; }
+ask()   { whiptail "$@" 3>&1 1>&2 2>&3; }
+new_id() { ask --inputbox "Accession / case ID (letters, digits, . _ -):" 9 60 "$(date +%Y%m%d)-001"; }
+
+FORMATS=(
+    ibm.1440        "PC 3.5\" HD 1.44MB"
+    ibm.720         "PC 3.5\" DD 720KB"
+    ibm.1200        "PC 5.25\" HD 1.2MB"
+    ibm.360         "PC 5.25\" DD 360KB"
+    amiga.amigados  "Amiga 880KB"
+    atari.st.720    "Atari ST 720KB"
+    mac.800         "Macintosh 800KB (GCR)"
+    mac.400         "Macintosh 400KB (GCR)"
+    commodore.1541  "Commodore 64 (40-track 5.25\" drive)"
+    flux            "Unknown: raw flux only"
+)
+
+floppy() {
+    local id fmt note
+    id=$(new_id) || return
+    fmt=$(ask --menu "Disk format" 20 70 10 "${FORMATS[@]}") || return
+    note=$(ask --inputbox "Label text / notes (optional):" 9 70) || return
+    clear; floppy-capture -f "$fmt" -n "$note" "$id"; pause
+}
+
+device() {
+    local devs=() line name id note
+    while read -r line; do
+        name=${line%% *}
+        devs+=("/dev/$name" "${line#* }")
+    done < <(lsblk -d -n -o NAME,SIZE,TRAN,MODEL -e 1,7 | grep -v "^$(lsblk -n -o PKNAME "$(findmnt -n -o SOURCE /)" | head -n1) ")
+    ((${#devs[@]})) || { whiptail --msgbox "No removable devices found. Plug one in and try again." 8 60; return; }
+    name=$(ask --menu "Device to image (it will be set read-only)" 18 74 8 "${devs[@]}") || return
+    id=$(new_id) || return
+    note=$(ask --inputbox "Label text / notes (optional):" 9 70) || return
+    clear; disk-capture -n "$note" "$name" "$id"; pause
+}
+
+analyse() {
+    local img
+    img=$(ask --inputbox "Path to an existing disk image (.img .iso .E01 .adf ...):" 9 74 "$HOME/") || return
+    clear; image-analyse "$img" "$(dirname "$img")/$(basename "$img").analysis"; pause
+}
+
+identify() {
+    local dir tool
+    dir=$(ask --inputbox "Folder or file:" 8 74 "$CASES") || return
+    tool=$(ask --menu "Tool" 14 70 5 \
+        sf "siegfried: PRONOM format IDs" \
+        fido "fido: PRONOM format IDs" \
+        droid "DROID (opens the GUI)" \
+        jhove "JHOVE: validate a single file" \
+        mediainfo "MediaInfo: audio/video technical metadata") || return
+    clear
+    case $tool in
+        sf)        sf "$dir" | less ;;
+        fido)      fido -recurse "$dir" | less ;;
+        droid)     droid >/dev/null 2>&1 & ;;
+        jhove)     jhove "$dir" | less ;;
+        mediainfo) mediainfo "$dir" | less ;;
+    esac
+}
+
+bag() {
+    local dir
+    dir=$(ask --inputbox "Folder to package as a BagIt bag (converted IN PLACE):" 9 74 "$CASES/") || return
+    clear
+    bagit.py --md5 --sha256 --contact-name "${USER}" "$dir" && bagit.py --validate "$dir"
+    pause
+}
+
+menu_of_installed() {   # title, then pairs of command / description
+    local title=$1; shift
+    local items=()
+    while (($#)); do have "$1" && items+=("$1" "$2"); shift 2; done
+    ((${#items[@]})) || { whiptail --msgbox "None installed." 8 40; return 1; }
+    ask --menu "$title" 22 72 14 "${items[@]}"
+}
+
+emulators() {
+    local e
+    e=$(menu_of_installed "Emulators" \
+        dosbox-x "DOS / Windows 3.x (DOSBox-X)" dosbox "DOS (DOSBox)" \
+        fs-uae-launcher "Amiga (needs Kickstart ROM)" hatari "Atari ST (TOS ROM or EmuTOS)" \
+        x64sc "Commodore 64 (VICE)" BasiliskII "Classic Mac 68k (needs ROM)" \
+        qemu-system-i386 "PC: old Windows/Linux (QEMU)" \
+        qemu-system-ppc "PowerPC Mac (QEMU)" mame "Arcade / micros (MAME)") || return
+    clear; "$e"
+}
+
+games() {
+    local g
+    g=$(menu_of_installed "Games" \
+        nethack "NetHack" crawl "Dungeon Crawl Stone Soup" angband "Angband" \
+        adventure "Colossal Cave Adventure" tetris-bsd "Tetris" robots "Robots" \
+        worm "Worm" hangman "Hangman" ninvaders "Space invaders" \
+        moon-buggy "Moon buggy" greed "Greed" pacman4console "Pac-Man-like" \
+        nsnake "Snake" frotz "Infocom-style text adventures") || return
+    clear
+    if [[ $g == frotz ]]; then echo "Usage: frotz story.z5"; pause; return; fi
+    "$g"
+}
+
+while true; do
+    choice=$(ask --title "Digital Preservation Station" --menu "" 22 66 14 \
+        1 "Floppy disk (Greaseweazle)" \
+        2 "USB stick / card / hard drive / CD-DVD" \
+        3 "Analyse an existing disk image" \
+        4 "Identify & validate file formats" \
+        5 "Package as BagIt" \
+        6 "Browse cases (Midnight Commander)" \
+        7 "Greaseweazle info / drive RPM" \
+        8 "Write-block status" \
+        9 "Update signatures & virus definitions" \
+        E "Emulators" \
+        G "Games" \
+        S "Shell" \
+        Q "Quit") || exit 0
+    case $choice in
+        1) floppy ;;
+        2) device ;;
+        3) analyse ;;
+        4) identify ;;
+        5) bag ;;
+        6) mkdir -p "$CASES"; mc "$CASES" ;;
+        7) clear; gw info; echo; echo "Insert any disk to measure RPM; Ctrl-C to stop."; gw rpm; pause ;;
+        8) clear; write-block status; pause ;;
+        9) clear; preservation-update; pause ;;
+        E) emulators ;;
+        G) games ;;
+        S) clear; echo "Type 'exit' to return to the menu."; "${SHELL:-bash}" ;;
+        Q) exit 0 ;;
+    esac
+done

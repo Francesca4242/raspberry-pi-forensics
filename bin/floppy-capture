@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Image a floppy with a Greaseweazle and run a BitCurator-style analysis.
+# Image a floppy with a Greaseweazle, then analyse it with image-analyse.
 #
 #   floppy-capture [options] ACCESSION_ID
 #
@@ -19,16 +19,12 @@
 # Output, in DIR/ACCESSION_ID/:
 #   flux.scp           raw flux (preservation master)
 #   disk.<ext>         decoded sector image
+#   decode-report.txt  good/bad sectors from the decode
 #   hashes.txt         md5/sha1/sha256 of the images
-#   disktype.txt       filesystem detection
-#   fls.txt            file listing incl. deleted entries
-#   disk.dfxml.xml     DFXML from fiwalk
-#   files/             extracted allocated files
-#   recovered/         extracted files incl. deleted
-#   formats.csv        PRONOM identification (siegfried, or fido)
-#   exif.csv           embedded metadata (exiftool)
-#   bulk_extractor/    emails, URLs, etc. (if installed)
+#   metadata.txt       who/when/what
 #   capture.log        everything that happened
+#   ...plus image-analyse's output (file listing, extracted files, PRONOM
+#   IDs, DFXML, metadata, virus scan) -- see "image-analyse -h"
 
 set -uo pipefail
 
@@ -39,7 +35,7 @@ OUTROOT="$HOME/cases"
 NOTE=""
 EXTRA=""
 
-usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while getopts "f:d:r:o:n:x:h" opt; do
     case "$opt" in
@@ -119,59 +115,12 @@ for f in "${sha_files[@]}"; do
     printf '%s  sha256  %s\n'    "$(sha256sum "$f" | cut -d' ' -f1)" "$f"
 done | tee hashes.txt
 
-if [[ ! -f $IMG ]]; then
-    step "Flux only; skipping filesystem analysis"
-    echo "finished:   $(date -Iseconds)" >> metadata.txt
-    exit 0
-fi
-
-step "Filesystem detection"
-have disktype && disktype "$IMG" | tee disktype.txt
-have fsstat   && fsstat "$IMG" > fsstat.txt 2>&1
-
-step "File listing (Sleuth Kit)"
-if have fls && fls -r -p -l "$IMG" > fls.txt 2>fls.err; then
-    echo "$(grep -c . fls.txt) entries; deleted ones are marked with '*'"
-else
-    echo "Sleuth Kit doesn't recognise this filesystem (common for Amiga/C64/Mac GCR)."
-fi
-
-step "DFXML (fiwalk)"
-have fiwalk && fiwalk -X disk.dfxml.xml "$IMG" >/dev/null 2>&1 \
-    && echo "wrote disk.dfxml.xml" || echo "fiwalk not available or failed"
-
-step "Extracting files"
-mkdir -p files recovered
-if have tsk_recover && [[ -s fls.txt ]]; then
-    tsk_recover -a "$IMG" files     || true
-    tsk_recover -e "$IMG" recovered || true
-elif [[ $EXT == img ]] && have mcopy && mdir -i "$IMG" ::/ >/dev/null 2>&1; then
-    mcopy -s -n -m -i "$IMG" ::/* files/ || true
-fi
-rmdir files recovered 2>/dev/null || true
-[[ -d files ]] && echo "$(find files -type f | wc -l) files extracted to files/"
-
-if [[ -d files ]]; then
-    step "Format identification (PRONOM)"
-    if have sf; then
-        sf -csv files > formats.csv && echo "siegfried -> formats.csv"
-    elif have fido; then
-        fido -recurse files > formats.csv && echo "fido -> formats.csv"
-    else
-        echo "neither siegfried (sf) nor fido installed; skipping"
-    fi
-    have exiftool && exiftool -r -csv files > exif.csv 2>/dev/null && echo "exiftool -> exif.csv"
-    have hashdeep && (cd files && hashdeep -r -c md5,sha256 . > ../files-manifest.txt) \
-        && echo "hashdeep -> files-manifest.txt"
-fi
-
-if have bulk_extractor; then
-    step "bulk_extractor"
-    bulk_extractor -o bulk_extractor "$IMG" >/dev/null 2>&1 \
-        && echo "results in bulk_extractor/" || echo "bulk_extractor failed"
-fi
-
-# Protect the evidence from accidental edits
 chmod a-w flux.scp "$IMG" 2>/dev/null
+
+if [[ -f $IMG ]]; then
+    image-analyse "$IMG" "$CASE"
+else
+    step "Flux only; skipping filesystem analysis"
+fi
 echo "finished:   $(date -Iseconds)" >> metadata.txt
 step "Done: $CASE"

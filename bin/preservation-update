@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Refresh format signatures, virus definitions and fast-moving tools while
+# the laptop is online, so it keeps working well offline afterwards.
+#
+#   preservation-update          signatures + virus definitions
+#   preservation-update --all    also apt upgrade and re-run setup modules
+
+set -uo pipefail
+say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+SUDO=""; [[ $EUID -ne 0 ]] && SUDO=sudo
+
+say "siegfried signatures (PRONOM)"
+command -v sf >/dev/null && sf -update || echo "siegfried not installed"
+
+say "ClamAV virus definitions"
+if command -v freshclam >/dev/null; then
+    $SUDO systemctl stop clamav-freshclam 2>/dev/null
+    $SUDO freshclam --quiet && echo "up to date"
+    $SUDO systemctl start clamav-freshclam 2>/dev/null
+fi
+
+say "Greaseweazle tools"
+[[ -x /opt/greaseweazle/bin/pip ]] && $SUDO /opt/greaseweazle/bin/pip install --quiet --upgrade \
+    "git+https://github.com/keirf/greaseweazle@latest" && gw --version | head -n1
+
+say "DROID"
+echo "DROID checks for new PRONOM signatures itself: open it and use Tools > Check for updates."
+
+if [[ ${1:-} == --all ]]; then
+    say "System packages"
+    $SUDO apt-get update && $SUDO apt-get -y full-upgrade
+    REPO=""
+    # shellcheck disable=SC1091
+    [[ -r /etc/preservation-station.conf ]] && . /etc/preservation-station.conf
+    for d in "$REPO" "$HOME/raspberry-pi-forensics"; do
+        if [[ -x $d/setup.sh ]]; then
+            say "Re-running setup modules from $d"
+            (cd "$d" && git pull --ff-only 2>/dev/null; $SUDO ./setup.sh)
+            break
+        fi
+    done
+fi

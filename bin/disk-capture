@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Image a block device (USB stick, memory card, hard drive via USB adapter,
+# USB floppy drive, CD/DVD) with GNU ddrescue, then analyse it.
+#
+#   disk-capture [options] DEVICE ACCESSION_ID
+#
+#   -o DIR    where cases are stored (default: ~/cases)
+#   -n NOTE   free-text note saved with the case
+#   -A        skip the analysis step (just image + hash)
+#
+# The device is set read-only (blockdev --setro) before reading. Use
+# "lsblk" or the menu to find the right DEVICE, e.g. /dev/sda or /dev/sr0.
+#
+# Output, in DIR/ACCESSION_ID/:
+#   disk.img or disc.iso   the image
+#   ddrescue.map           ddrescue map: which areas read OK
+#   device-info.txt        model, serial, size, SMART identity
+#   hashes.txt, metadata.txt, capture.log, plus image-analyse's output
+#
+# Audio CDs have no data track to image: rip them with "whipper cd rip".
+
+set -uo pipefail
+
+OUTROOT="$HOME/cases"
+NOTE=""
+ANALYSE=1
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+while getopts "o:n:Ah" opt; do
+    case "$opt" in
+        o) OUTROOT=$OPTARG ;;
+        n) NOTE=$OPTARG ;;
+        A) ANALYSE=0 ;;
+        h) usage 0 ;;
+        *) usage 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+[[ $# -eq 2 ]] || usage 2
+DEV=$1 ID=$2
+[[ -b $DEV ]] || { echo "$DEV is not a block device (see lsblk)" >&2; exit 1; }
+[[ $ID =~ ^[A-Za-z0-9._-]+$ ]] || { echo "ACCESSION_ID may only use letters, digits, . _ -" >&2; exit 2; }
+
+SUDO=""; [[ $EUID -ne 0 ]] && SUDO=sudo
+root_disk=$(lsblk -n -o PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -n1)
+if [[ $(basename "$DEV") == "$root_disk" ]]; then
+    echo "$DEV holds this computer's operating system; refusing." >&2; exit 1
+fi
+if lsblk -n -o MOUNTPOINT "$DEV" | grep -q .; then
+    echo "$DEV (or a partition) is mounted. Unmount it first:" >&2
+    lsblk -o NAME,MOUNTPOINT "$DEV" >&2; exit 1
+fi
+
+CASE="$OUTROOT/$ID"
+[[ -e $CASE ]] && { echo "Case $CASE already exists; refusing to overwrite evidence." >&2; exit 1; }
+mkdir -p "$CASE" && cd "$CASE" || exit 1
+exec > >(tee -a capture.log) 2>&1
+step() { printf '\n=== %s ===\n' "$*"; }
+
+if [[ $(basename "$DEV") == sr* ]]; then
+    IMG=disc.iso; BS=(-b 2048)
+else
+    IMG=disk.img; BS=()
+fi
+
+step "Case $ID"
+{
+    echo "accession:  $ID"
+    echo "started:    $(date -Iseconds)"
+    echo "operator:   ${USER:-unknown}@$(hostname)"
+    echo "device:     $DEV"
+    echo "note:       $NOTE"
+    echo "ddrescue:   $(ddrescue --version | head -n1)"
+} | tee metadata.txt
+
+step "Write-blocking $DEV"
+$SUDO blockdev --setro "$DEV"
+for p in "$DEV"?*; do [[ -b $p ]] && $SUDO blockdev --setro "$p"; done
+echo "read-only flag: $(blockdev --getro "$DEV" 2>/dev/null || $SUDO blockdev --getro "$DEV")"
+
+step "Device information"
+{
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MODEL,SERIAL,TRAN "$DEV"
+    echo
+    udevadm info --query=property --name="$DEV" | grep -E '^ID_(VENDOR|MODEL|SERIAL|BUS|FS_|PART_TABLE)' || true
+    echo
+    $SUDO smartctl -i "$DEV" 2>/dev/null || true
+} | tee device-info.txt
+
+step "Imaging (pass 1: fast, skip bad areas)"
+$SUDO ddrescue "${BS[@]}" -n "$DEV" "$IMG" ddrescue.map
+step "Imaging (pass 2: retry bad areas 3 times)"
+$SUDO ddrescue "${BS[@]}" -d -r3 "$DEV" "$IMG" ddrescue.map \
+    || $SUDO ddrescue "${BS[@]}" -r3 "$DEV" "$IMG" ddrescue.map
+$SUDO chown "$(id -u):$(id -g)" "$IMG" ddrescue.map
+ddrescuelog -t ddrescue.map 2>/dev/null | tee -a metadata.txt
+
+step "Hashes"
+{
+    printf '%s  md5     %s\n'    "$(md5sum    "$IMG" | cut -d' ' -f1)" "$IMG"
+    printf '%s  sha1    %s\n'    "$(sha1sum   "$IMG" | cut -d' ' -f1)" "$IMG"
+    printf '%s  sha256  %s\n'    "$(sha256sum "$IMG" | cut -d' ' -f1)" "$IMG"
+} | tee hashes.txt
+chmod a-w "$IMG"
+
+((ANALYSE)) && image-analyse "$IMG" "$CASE"
+echo "finished:   $(date -Iseconds)" >> metadata.txt
+step "Done: $CASE  (the device is still read-only: 'write-block off $DEV' to undo)"

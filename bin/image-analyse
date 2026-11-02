@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# BitCurator-style analysis of a disk image (floppy, USB stick, hard drive,
+# CD/DVD ISO, E01...). Used by floppy-capture and disk-capture, and handy on
+# its own for images you've received from elsewhere.
+#
+#   image-analyse IMAGE [OUTDIR]
+#
+# OUTDIR defaults to the image's folder. Writes:
+#   disktype.txt, mmls.txt, fsstat.txt   what's on the image
+#   fls.txt                              file listing; deleted entries marked *
+#   <image>.dfxml.xml                    Digital Forensics XML (fiwalk)
+#   files/  recovered/                   allocated / allocated+deleted files
+#   files-manifest.txt                   per-file hashes (hashdeep)
+#   formats.csv                          PRONOM IDs (siegfried, else fido)
+#   brunnhilde/                          HTML format report (if installed)
+#   exif.csv                             embedded metadata (exiftool)
+#   clamav.txt                           virus scan of extracted files
+#   bulk_extractor/                      emails, URLs, card numbers, ...
+#   analysis.log                         everything that happened
+
+set -uo pipefail
+
+[[ $# -ge 1 && $1 != -h ]] || { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+IMG=$(realpath "$1")
+OUT=$(realpath "${2:-$(dirname "$IMG")}")
+[[ -f $IMG ]] || { echo "no such image: $IMG" >&2; exit 1; }
+mkdir -p "$OUT" && cd "$OUT" || exit 1
+exec > >(tee -a analysis.log) 2>&1
+
+have() { command -v "$1" >/dev/null 2>&1; }
+step() { printf '\n=== %s ===\n' "$*"; }
+BASE=$(basename "$IMG")
+
+# E01/AFF images need a format hint for Sleuth Kit
+TSK=()
+case "${IMG,,}" in
+    *.e01) TSK=(-i ewf) ;;
+    *.aff) TSK=(-i afflib) ;;
+esac
+
+step "Analysing $BASE  ($(date -Iseconds))"
+
+step "What's on the image"
+have disktype && disktype "$IMG" | tee disktype.txt
+have mmls && mmls "${TSK[@]}" "$IMG" > mmls.txt 2>/dev/null && cat mmls.txt
+
+# Find filesystem offsets: whole image, or each partition from mmls
+OFFSETS=()
+if fsstat "${TSK[@]}" "$IMG" > fsstat.txt 2>&1; then
+    OFFSETS=(0)
+elif [[ -s mmls.txt ]]; then
+    while read -r start; do
+        fsstat "${TSK[@]}" -o "$start" "$IMG" >/dev/null 2>&1 && OFFSETS+=("$start")
+    done < <(awk '/^[0-9]+:/ && $2 ~ /^[0-9]+:[0-9]+$/ {print $3+0}' mmls.txt)
+fi
+((${#OFFSETS[@]})) || rm -f fsstat.txt
+
+step "File listing (Sleuth Kit)"
+: > fls.txt
+for off in "${OFFSETS[@]}"; do
+    echo "### filesystem at sector offset $off" >> fls.txt
+    fls "${TSK[@]}" -o "$off" -r -p -l "$IMG" >> fls.txt 2>/dev/null
+done
+if ((${#OFFSETS[@]})); then
+    echo "$(grep -vc '^###' fls.txt) entries in ${#OFFSETS[@]} filesystem(s); deleted ones are marked '*'"
+else
+    rm -f fls.txt
+    echo "Sleuth Kit doesn't recognise a filesystem here."
+    echo "(Normal for Amiga, C64, classic Mac and many proprietary formats: try an emulator.)"
+fi
+
+step "DFXML (fiwalk)"
+if have fiwalk && fiwalk -X "$BASE.dfxml.xml" "$IMG" >/dev/null 2>&1; then
+    echo "wrote $BASE.dfxml.xml"
+else
+    echo "fiwalk unavailable or failed"
+fi
+
+step "Extracting files"
+mkdir -p files recovered
+for off in "${OFFSETS[@]}"; do
+    sub=""; ((${#OFFSETS[@]} > 1)) && sub="/part-$off"
+    tsk_recover "${TSK[@]}" -o "$off" -a "$IMG" "files$sub"     >/dev/null 2>&1 || true
+    tsk_recover "${TSK[@]}" -o "$off" -e "$IMG" "recovered$sub" >/dev/null 2>&1 || true
+done
+if ((${#OFFSETS[@]} == 0)) && have mcopy && mdir -i "$IMG" ::/ >/dev/null 2>&1; then
+    mcopy -s -n -m -i "$IMG" ::/* files/ 2>/dev/null || true
+fi
+find files recovered -depth -type d -empty -delete 2>/dev/null
+if [[ -d files ]]; then
+    echo "$(find files -type f | wc -l) files -> files/"
+    [[ -d recovered ]] && echo "$(find recovered -type f | wc -l) files incl. deleted -> recovered/"
+else
+    echo "nothing extracted"
+fi
+
+if [[ -d files ]]; then
+    step "Fixity"
+    have hashdeep && (cd files && hashdeep -r -c md5,sha256 . > ../files-manifest.txt) \
+        && echo "hashdeep -> files-manifest.txt"
+
+    step "Format identification (PRONOM)"
+    if have sf; then
+        sf -csv files > formats.csv && echo "siegfried -> formats.csv"
+        cut -d, -f6 formats.csv | tail -n +2 | sort | uniq -c | sort -rn | head -15
+    elif have fido; then
+        fido -recurse files > formats.csv && echo "fido -> formats.csv"
+    else
+        echo "neither siegfried (sf) nor fido installed"
+    fi
+    if have brunnhilde.py && have sf; then
+        brunnhilde.py files . brunnhilde >/dev/null 2>&1 \
+            && echo "Brunnhilde report -> brunnhilde/" || echo "brunnhilde failed"
+    fi
+
+    step "Embedded metadata"
+    have exiftool && exiftool -q -r -csv files > exif.csv 2>/dev/null && echo "exiftool -> exif.csv"
+
+    step "Virus scan"
+    if have clamscan; then
+        clamscan -r -i --no-summary files > clamav.txt 2>&1
+        if [[ -s clamav.txt ]]; then cat clamav.txt; else echo "clean"; fi
+    else
+        echo "clamav not installed"
+    fi
+fi
+
+if have bulk_extractor; then
+    step "bulk_extractor (can take a while on big images)"
+    rm -rf bulk_extractor
+    bulk_extractor -o bulk_extractor "$IMG" >/dev/null 2>&1 \
+        && echo "results in bulk_extractor/" || echo "bulk_extractor failed"
+fi
+
+step "Analysis done: $OUT"
