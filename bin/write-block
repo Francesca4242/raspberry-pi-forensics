@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Software write-block for block devices.
+#
+#   write-block on  /dev/sdX    mark device (and partitions) read-only
+#   write-block off /dev/sdX    make it writable again
+#   write-block status          show read-only flag of every disk
+#   write-block auto sdX        used by udev; never touches the root disk
+#
+# A software write-block is a safety net, not a substitute for the disk's
+# own write-protect tab. Greaseweazle reads never write to the disk anyway.
+
+set -euo pipefail
+
+root_disk() {
+    local src
+    src=$(findmnt -n -o SOURCE /)
+    lsblk -n -o PKNAME "$src" 2>/dev/null | head -n1
+}
+
+set_ro() {
+    local dev=$1 flag=$2 p
+    blockdev "$flag" "$dev"
+    for p in "$dev"?*; do [[ -b $p ]] && blockdev "$flag" "$p"; done
+}
+
+case "${1:-status}" in
+    on|off)
+        dev=${2:?device, e.g. /dev/sda}
+        [[ $(basename "$dev") == "$(root_disk)" ]] && { echo "refusing: $dev holds /" >&2; exit 1; }
+        if [[ $1 == on ]]; then set_ro "$dev" --setro; else set_ro "$dev" --setrw; fi
+        lsblk -o NAME,RO,SIZE,MODEL "$dev"
+        ;;
+    auto)
+        name=${2:?}
+        [[ $name == "$(root_disk)" ]] && exit 0
+        set_ro "/dev/$name" --setro
+        logger -t write-block "set /dev/$name read-only"
+        ;;
+    status)
+        lsblk -d -o NAME,RO,RM,SIZE,TRAN,MODEL
+        ;;
+    *) sed -n '2,10p' "$0"; exit 2 ;;
+esac

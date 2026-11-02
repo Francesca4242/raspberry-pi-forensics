@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# Image a floppy with a Greaseweazle and run a BitCurator-style analysis.
+#
+#   floppy-capture [options] ACCESSION_ID
+#
+# Options:
+#   -f FORMAT   Greaseweazle disk format to decode the flux into a sector
+#               image (default: ibm.1440). Use "flux" to keep only the raw
+#               flux. Examples: ibm.720 ibm.1440 ibm.360 ibm.1200
+#               amiga.amigados mac.400 mac.800 commodore.1541 atari.st.720
+#               ("gw convert --help" lists them all).
+#   -d DRIVE    Drive on the Greaseweazle bus: A, B, 0, 1 (default: A)
+#   -r REVS     Revolutions of flux to capture per track (default: 3)
+#   -o DIR      Where cases are stored (default: ~/cases)
+#   -n NOTE     Free-text note saved with the case (label text etc.)
+#   -x ARGS     Extra arguments passed to "gw read", e.g.
+#               -x "--tracks=c=0-39:step=2" for 40-track disks in an 80-track drive
+#
+# Output, in DIR/ACCESSION_ID/:
+#   flux.scp           raw flux (preservation master)
+#   disk.<ext>         decoded sector image
+#   hashes.txt         md5/sha1/sha256 of the images
+#   disktype.txt       filesystem detection
+#   fls.txt            file listing incl. deleted entries
+#   disk.dfxml.xml     DFXML from fiwalk
+#   files/             extracted allocated files
+#   recovered/         extracted files incl. deleted
+#   formats.csv        PRONOM identification (siegfried, or fido)
+#   exif.csv           embedded metadata (exiftool)
+#   bulk_extractor/    emails, URLs, etc. (if installed)
+#   capture.log        everything that happened
+
+set -uo pipefail
+
+FORMAT=ibm.1440
+DRIVE=A
+REVS=3
+OUTROOT="$HOME/cases"
+NOTE=""
+EXTRA=""
+
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while getopts "f:d:r:o:n:x:h" opt; do
+    case "$opt" in
+        f) FORMAT=$OPTARG ;;
+        d) DRIVE=$OPTARG ;;
+        r) REVS=$OPTARG ;;
+        o) OUTROOT=$OPTARG ;;
+        n) NOTE=$OPTARG ;;
+        x) EXTRA=$OPTARG ;;
+        h) usage 0 ;;
+        *) usage 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+[[ $# -eq 1 ]] || usage 2
+ID=$1
+[[ $ID =~ ^[A-Za-z0-9._-]+$ ]] || { echo "ACCESSION_ID may only use letters, digits, . _ -" >&2; exit 2; }
+
+CASE="$OUTROOT/$ID"
+if [[ -e $CASE ]]; then
+    echo "Case $CASE already exists; refusing to overwrite evidence." >&2
+    exit 1
+fi
+mkdir -p "$CASE"
+cd "$CASE" || exit 1
+exec > >(tee -a capture.log) 2>&1
+
+have() { command -v "$1" >/dev/null 2>&1; }
+step() { printf '\n=== %s ===\n' "$*"; }
+
+case "$FORMAT" in
+    amiga.*)       EXT=adf ;;
+    commodore.*)   EXT=d64 ;;
+    atari.st.*)    EXT=st  ;;
+    *)             EXT=img ;;
+esac
+IMG="disk.$EXT"
+
+step "Case $ID"
+{
+    echo "accession:  $ID"
+    echo "started:    $(date -Iseconds)"
+    echo "operator:   ${USER:-unknown}@$(hostname)"
+    echo "format:     $FORMAT"
+    echo "drive:      $DRIVE"
+    echo "revs:       $REVS"
+    echo "note:       $NOTE"
+    echo "gw version: $(gw --version 2>&1 | head -n1)"
+} | tee metadata.txt
+
+step "Greaseweazle"
+gw info || { echo "No Greaseweazle found. Is it plugged in? Are you in 'dialout'?"; exit 1; }
+
+echo
+echo "Make sure the disk's write-protect tab is OPEN (protected) before continuing."
+read -r -p "Insert disk and press Enter to read (Ctrl-C to abort)... " _
+
+step "Reading flux"
+# shellcheck disable=SC2086  # EXTRA is intentionally word-split
+if ! gw read --drive="$DRIVE" --revs="$REVS" $EXTRA flux.scp; then
+    echo "Flux read failed." ; exit 1
+fi
+
+if [[ $FORMAT != flux ]]; then
+    step "Decoding flux to $IMG ($FORMAT)"
+    # Bad sectors are reported here but the image is still written.
+    gw convert --format="$FORMAT" flux.scp "$IMG" | tee decode-report.txt \
+        || echo "WARNING: decode reported errors, see decode-report.txt"
+fi
+
+step "Hashes"
+sha_files=(flux.scp)
+[[ -f $IMG ]] && sha_files+=("$IMG")
+for f in "${sha_files[@]}"; do
+    printf '%s  md5     %s\n'    "$(md5sum    "$f" | cut -d' ' -f1)" "$f"
+    printf '%s  sha1    %s\n'    "$(sha1sum   "$f" | cut -d' ' -f1)" "$f"
+    printf '%s  sha256  %s\n'    "$(sha256sum "$f" | cut -d' ' -f1)" "$f"
+done | tee hashes.txt
+
+if [[ ! -f $IMG ]]; then
+    step "Flux only; skipping filesystem analysis"
+    echo "finished:   $(date -Iseconds)" >> metadata.txt
+    exit 0
+fi
+
+step "Filesystem detection"
+have disktype && disktype "$IMG" | tee disktype.txt
+have fsstat   && fsstat "$IMG" > fsstat.txt 2>&1
+
+step "File listing (Sleuth Kit)"
+if have fls && fls -r -p -l "$IMG" > fls.txt 2>fls.err; then
+    echo "$(grep -c . fls.txt) entries; deleted ones are marked with '*'"
+else
+    echo "Sleuth Kit doesn't recognise this filesystem (common for Amiga/C64/Mac GCR)."
+fi
+
+step "DFXML (fiwalk)"
+have fiwalk && fiwalk -X disk.dfxml.xml "$IMG" >/dev/null 2>&1 \
+    && echo "wrote disk.dfxml.xml" || echo "fiwalk not available or failed"
+
+step "Extracting files"
+mkdir -p files recovered
+if have tsk_recover && [[ -s fls.txt ]]; then
+    tsk_recover -a "$IMG" files     || true
+    tsk_recover -e "$IMG" recovered || true
+elif [[ $EXT == img ]] && have mcopy && mdir -i "$IMG" ::/ >/dev/null 2>&1; then
+    mcopy -s -n -m -i "$IMG" ::/* files/ || true
+fi
+rmdir files recovered 2>/dev/null || true
+[[ -d files ]] && echo "$(find files -type f | wc -l) files extracted to files/"
+
+if [[ -d files ]]; then
+    step "Format identification (PRONOM)"
+    if have sf; then
+        sf -csv files > formats.csv && echo "siegfried -> formats.csv"
+    elif have fido; then
+        fido -recurse files > formats.csv && echo "fido -> formats.csv"
+    else
+        echo "neither siegfried (sf) nor fido installed; skipping"
+    fi
+    have exiftool && exiftool -r -csv files > exif.csv 2>/dev/null && echo "exiftool -> exif.csv"
+    have hashdeep && (cd files && hashdeep -r -c md5,sha256 . > ../files-manifest.txt) \
+        && echo "hashdeep -> files-manifest.txt"
+fi
+
+if have bulk_extractor; then
+    step "bulk_extractor"
+    bulk_extractor -o bulk_extractor "$IMG" >/dev/null 2>&1 \
+        && echo "results in bulk_extractor/" || echo "bulk_extractor failed"
+fi
+
+# Protect the evidence from accidental edits
+chmod a-w flux.scp "$IMG" 2>/dev/null
+echo "finished:   $(date -Iseconds)" >> metadata.txt
+step "Done: $CASE"
