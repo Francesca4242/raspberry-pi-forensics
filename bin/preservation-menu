@@ -67,6 +67,21 @@ identify() {
     esac
 }
 
+mount_ro() {
+    local what
+    what=$(ask --menu "Read-only mounts" 12 60 3 \
+        m "Mount an image or device read-only" \
+        l "List mounted evidence" \
+        u "Unmount everything") || return
+    clear
+    case $what in
+        m) what=$(ask --inputbox "Image or device to mount:" 9 74 "$CASES/") || return
+           clear; ro-mount "$what" && mc /mnt/evidence ;;
+        l) ro-mount -l; pause ;;
+        u) ro-mount -u all; pause ;;
+    esac
+}
+
 bag() {
     local dir
     dir=$(ask --inputbox "Folder to package as a BagIt bag (converted IN PLACE):" 9 74 "$CASES/") || return
@@ -108,10 +123,11 @@ games() {
 }
 
 while true; do
-    choice=$(ask --title "Digital Preservation Station" --menu "" 22 66 14 \
+    choice=$(ask --title "Digital Preservation Station" --menu "" 23 66 15 \
         1 "Floppy disk (Greaseweazle)" \
         2 "USB stick / card / hard drive / CD-DVD" \
         3 "Analyse an existing disk image" \
+        M "Mount an image read-only & browse" \
         4 "Identify & validate file formats" \
         5 "Package as BagIt" \
         6 "Browse cases (Midnight Commander)" \
@@ -126,6 +142,7 @@ while true; do
         1) floppy ;;
         2) device ;;
         3) analyse ;;
+        M) mount_ro ;;
         4) identify ;;
         5) bag ;;
         6) mkdir -p "$CASES"; mc "$CASES" ;;

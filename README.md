@@ -70,6 +70,7 @@ it left off.
 | `floppy` | Greaseweazle `gw`; mtools, hfsutils/hfsprogs (Mac), cpmtools (CP/M), unadf (Amiga), disktype |
 | `imaging` | GNU ddrescue, dc3dd, Guymager, ewf-tools (E01), AFF tools, cdparanoia, whipper (audio CDs), cdrdao, dvdisaster, xorriso, dmg2img, qemu-img, smartmontools |
 | `forensics` | Sleuth Kit, fiwalk/DFXML, bulk_extractor, foremost, scalpel, PhotoRec/TestDisk, binwalk, YARA, ClamAV, exiftool, hashdeep, oletools |
+| `bitcurator` | The rest of the BitCurator toolset that runs on ARM: libyal tools (shadow copies, BitLocker, FileVault, LUKS, VMDK/VHD/QCOW, APFS/NTFS/HFS), plaso timelines, RegRipper and Windows artefact parsers (event logs, LNK, prefetch, Recycle Bin, Thumbs.db), ssdeep, fdupes, xmount, dislocker, HFSExplorer/unhfs, GtkHash |
 | `identification` | siegfried and roy, DROID, fido, JHOVE, MediaInfo, MediaConch, Brunnhilde, poppler/qpdf |
 | `preservation` | BagIt; email tools (readpst, pff-tools, msgconvert); web archives (wget WARC, HTTrack, warcio, pywb); legacy documents (antiword, catdoc, unrtf, wv); pandoc, ImageMagick, Ghostscript, FFmpeg, SoX, Tesseract OCR, OCRmyPDF; archive formats (7z, unar, cabextract, lha, arj, zoo, unace, ...) |
 | `emulation` | DOSBox, DOSBox-X, FS-UAE (Amiga), Hatari (Atari ST), VICE (C64), Basilisk II (68k Mac), QEMU (x86/PPC/68k), MAME |
@@ -146,13 +147,30 @@ disks. It writes:
 |---|---|
 | `disktype.txt`, `mmls.txt`, `fsstat.txt` | Partitions and filesystems |
 | `fls.txt` | Every file, including deleted ones (marked `*`) |
+| `timeline.csv` | Every created/modified/accessed timestamp, in date order |
 | `*.dfxml.xml` | Digital Forensics XML |
 | `files/`, `recovered/` | Extracted files; `recovered/` also has deleted files |
 | `files-manifest.txt` | Per-file MD5 and SHA-256 |
+| `files-ssdeep.txt`, `duplicates.txt` | Fuzzy hashes (spot near-identical files) and exact duplicates |
 | `formats.csv`, `brunnhilde/` | PRONOM format identification and an HTML report |
 | `exif.csv` | Embedded metadata |
 | `clamav.txt` | Virus scan |
 | `bulk_extractor/` | Email addresses, URLs, phone numbers, card numbers and so on |
+
+### Browsing an image read-only
+
+```bash
+ro-mount disk.img
+```
+
+This mounts every filesystem on an image, E01 or device under
+`/mnt/evidence/<name>/`, so you can open it in a file manager. The loop
+device is read-only, and so are the mounts. They also block running programs
+from the image, and ext3/ext4 journals are never replayed, because replaying
+one would change the disk. `ro-mount -l` lists what's mounted;
+`ro-mount -u all` unmounts everything.
+
+For classic Mac disks, use `hfsexplorer` (GUI) or `unhfs` instead.
 
 ### Identifying, validating and packaging
 
@@ -169,6 +187,10 @@ disks. It writes:
 | Capture a website to WARC | `wget --mirror --warc-file=site https://example.org/` |
 | Replay a WARC | `wb-manager init coll && wb-manager add coll site.warc.gz && wayback`, then open <http://localhost:8080/coll/> |
 | Make a scanned PDF searchable | `ocrmypdf in.pdf out.pdf` |
+| Super-timeline of a whole disk (file system, browser, registry, logs) | `psteal.py --source disk.img -o dynamic -w timeline.csv` |
+| Windows registry report | `regripper -r path/to/NTUSER.DAT -a` |
+| BitLocker volume (with the recovery key) | `bdemount -r KEY disk.img /mnt/bde` |
+| Old Windows Recycle Bin / Thumbs.db | `rifiuti-vista $Recycle.Bin/S-.../`, `vinetto Thumbs.db` |
 
 ## Keeping it working offline
 
@@ -220,6 +242,11 @@ also on the command line, e.g. `nethack`, `adventure`, `tetris-bsd`.
   ground.
 - **JHOVE**: if your OS release doesn't package it, get it from
   <https://jhove.openpreservation.org>.
+
+## Roadmap
+
+[ROADMAP.md](ROADMAP.md) lists things you might want later: more capture
+hardware, more software, and workflow improvements.
 
 ## Related
 

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Mount a disk image or device read-only so you can browse it in a file
+# manager, the way BitCurator's Mounter does.
+#
+#   ro-mount IMAGE|DEVICE     mount every filesystem on it under /mnt/evidence/NAME/
+#   ro-mount -l               list what's mounted
+#   ro-mount -u NAME|all      unmount
+#
+# Works with raw images (.img .iso .dd .adf...), E01 (via ewfmount) and block
+# devices. Mounts use ro,noexec,nodev,nosuid; ext3/4 also get "noload" so the
+# journal is never replayed. Loop devices are created read-only too.
+
+set -uo pipefail
+BASE=/mnt/evidence
+SUDO=""; [[ $EUID -ne 0 ]] && SUDO=sudo
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+list() {
+    findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | awk -v b="$BASE/" 'index($1, b) == 1' \
+        | while read -r t s f o; do printf '%-45s %-14s %-8s %s\n' "$t" "$s" "$f" "${o%%,*}"; done
+}
+
+unmount_one() {
+    local dir=$BASE/$1 m loops=() l
+    [[ -d $dir ]] || { echo "nothing mounted as $1" >&2; return 1; }
+    while read -r m; do
+        loops+=("$(findmnt -n -o SOURCE "$m")")
+        $SUDO umount "$m"
+    done < <(findmnt -rn -o TARGET | grep "^$dir/" | sort -r)
+    for l in "${loops[@]}"; do
+        [[ $l == /dev/loop* ]] || continue
+        l=${l%p[0-9]*}
+        $SUDO losetup -d "$l" 2>/dev/null
+    done
+    [[ -f $dir/.loop ]] && $SUDO losetup -d "$(cat "$dir/.loop")" 2>/dev/null
+    mountpoint -q "$dir/.ewf" && $SUDO umount "$dir/.ewf"
+    $SUDO find "$dir" -depth -type d -empty -delete 2>/dev/null
+    $SUDO rm -f "$dir/.loop"; $SUDO rmdir "$dir" 2>/dev/null
+    echo "unmounted $1"
+}
+
+mount_fs() {   # mount_fs DEVICE DIR
+    local dev=$1 dir=$2 fs opts=ro,noexec,nodev,nosuid
+    fs=$($SUDO blkid -o value -s TYPE "$dev" 2>/dev/null)
+    [[ -n $fs ]] || return 1
+    case $fs in
+        ext3|ext4) opts+=,noload ;;
+        swap|crypto_LUKS|BitLocker) echo "  $dev: $fs, not mountable as-is (see bdemount/luksdemount)"; return 1 ;;
+    esac
+    $SUDO mkdir -p "$dir"
+    if [[ $fs == ntfs ]] && command -v ntfs-3g >/dev/null; then
+        $SUDO ntfs-3g -o "ro,noexec,nodev,nosuid,show_sys_files" "$dev" "$dir"
+    else
+        $SUDO mount -t "$fs" -o "$opts" "$dev" "$dir"
+    fi && echo "  $dev ($fs) -> $dir"
+}
+
+case "${1:-}" in
+    ""|-h|--help) usage 0 ;;
+    -l) list; exit 0 ;;
+    -u)
+        target=${2:?NAME or all}
+        if [[ $target == all ]]; then
+            for d in "$BASE"/*/; do [[ -d $d ]] && unmount_one "$(basename "$d")"; done
+        else
+            unmount_one "$target"
+        fi
+        exit 0 ;;
+esac
+
+SRC=$(realpath "$1")
+NAME=$(basename "$SRC"); NAME=${NAME//[^A-Za-z0-9._-]/_}
+DIR=$BASE/$NAME
+[[ -e $DIR ]] && { echo "$DIR already exists (ro-mount -u $NAME first)" >&2; exit 1; }
+$SUDO mkdir -p "$DIR"
+
+if [[ ${SRC,,} == *.e01 ]]; then
+    $SUDO mkdir -p "$DIR/.ewf"
+    $SUDO ewfmount "$SRC" "$DIR/.ewf" >/dev/null || { echo "ewfmount failed" >&2; exit 1; }
+    RAW=$DIR/.ewf/ewf1
+else
+    RAW=$SRC
+fi
+
+if [[ -b $RAW ]]; then
+    $SUDO blockdev --setro "$RAW"
+    LOOP=$RAW
+else
+    LOOP=$($SUDO losetup -f -r -P --show "$RAW") || { echo "losetup failed" >&2; exit 1; }
+    echo "$LOOP" | $SUDO tee "$DIR/.loop" >/dev/null
+fi
+sleep 1   # let udev create partition nodes
+
+echo "Mounting $SRC read-only:"
+n=0
+mapfile -t parts < <(lsblk -ln -o PATH,TYPE "$LOOP" | awk '$2 == "part" {print $1}')
+if ((${#parts[@]})); then
+    for p in "${parts[@]}"; do mount_fs "$p" "$DIR/p${p##*[!0-9]}" && n=$((n + 1)); done
+else
+    mount_fs "$LOOP" "$DIR/fs" && n=$((n + 1))
+fi
+
+if ((n == 0)); then
+    echo "No mountable filesystem found. Try HFSExplorer (Mac), an emulator, or image-analyse."
+    unmount_one "$NAME" >/dev/null
+    exit 1
+fi
+echo "Done. Unmount with: ro-mount -u $NAME"

@@ -8,9 +8,11 @@
 # OUTDIR defaults to the image's folder. Writes:
 #   disktype.txt, mmls.txt, fsstat.txt   what's on the image
 #   fls.txt                              file listing; deleted entries marked *
+#   timeline.csv                         MAC-time timeline of every file (mactime)
 #   <image>.dfxml.xml                    Digital Forensics XML (fiwalk)
 #   files/  recovered/                   allocated / allocated+deleted files
 #   files-manifest.txt                   per-file hashes (hashdeep)
+#   files-ssdeep.txt, duplicates.txt     fuzzy hashes, duplicate files
 #   formats.csv                          PRONOM IDs (siegfried, else fido)
 #   brunnhilde/                          HTML format report (if installed)
 #   exif.csv                             embedded metadata (exiftool)
@@ -20,7 +22,7 @@
 
 set -uo pipefail
 
-[[ $# -ge 1 && $1 != -h ]] || { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[[ $# -ge 1 && $1 != -h ]] || { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 IMG=$(realpath "$1")
 OUT=$(realpath "${2:-$(dirname "$IMG")}")
 [[ -f $IMG ]] || { echo "no such image: $IMG" >&2; exit 1; }
@@ -69,6 +71,18 @@ else
     echo "(Normal for Amiga, C64, classic Mac and many proprietary formats: try an emulator.)"
 fi
 
+if ((${#OFFSETS[@]})) && have mactime; then
+    step "Timeline (Sleuth Kit mactime)"
+    : > bodyfile.txt
+    for off in "${OFFSETS[@]}"; do
+        fls "${TSK[@]}" -o "$off" -r -m "/" "$IMG" >> bodyfile.txt 2>/dev/null
+    done
+    mactime -b bodyfile.txt -d -y > timeline.csv 2>/dev/null \
+        && echo "$(($(wc -l < timeline.csv) - 1)) events -> timeline.csv" \
+        && head -n 4 timeline.csv
+    rm -f bodyfile.txt
+fi
+
 step "DFXML (fiwalk)"
 if have fiwalk && fiwalk -X "$BASE.dfxml.xml" "$IMG" >/dev/null 2>&1; then
     echo "wrote $BASE.dfxml.xml"
@@ -98,6 +112,13 @@ if [[ -d files ]]; then
     step "Fixity"
     have hashdeep && (cd files && hashdeep -r -c md5,sha256 . > ../files-manifest.txt) \
         && echo "hashdeep -> files-manifest.txt"
+    have ssdeep && (cd files && ssdeep -r -l . > ../files-ssdeep.txt 2>/dev/null) \
+        && echo "ssdeep -> files-ssdeep.txt"
+    if have fdupes; then
+        fdupes -r files > duplicates.txt 2>/dev/null
+        if [[ -s duplicates.txt ]]; then echo "duplicate files listed in duplicates.txt"
+        else rm -f duplicates.txt; fi
+    fi
 
     step "Format identification (PRONOM)"
     if have sf; then
